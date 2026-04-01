@@ -1,15 +1,23 @@
 const express = require('express');
 const Database = require('better-sqlite3');
+const multer = require('multer');
+const fs = require('fs');
 const path = require('path');
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-app.use(express.json());
+// Use RAILWAY_VOLUME_MOUNT_PATH for persistent storage on Railway, fallback to local ./data
+const DATA_DIR = process.env.RAILWAY_VOLUME_MOUNT_PATH || path.join(__dirname, 'data');
+if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+
+const upload = multer({ dest: path.join(DATA_DIR, 'uploads') });
+
+app.use(express.json({ limit: '500mb' }));
 app.use(express.static(path.join(__dirname, 'public')));
 
 // Initialize database
-const db = new Database(path.join(__dirname, 'data', 'charities.db'));
+const db = new Database(path.join(DATA_DIR, 'charities.db'));
 db.pragma('journal_mode = WAL');
 db.pragma('foreign_keys = ON');
 
@@ -269,6 +277,143 @@ app.get('/api/export/csv', (req, res) => {
     res.send([headers.join(','), ...csvRows].join('\n'));
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+// POST /api/import - Upload and import JSON file via the web UI
+let importInProgress = false;
+app.post('/api/import', upload.single('file'), async (req, res) => {
+  if (importInProgress) {
+    return res.status(409).json({ error: 'Import already in progress' });
+  }
+  if (!req.file) {
+    return res.status(400).json({ error: 'No file uploaded' });
+  }
+
+  importInProgress = true;
+
+  try {
+    const raw = fs.readFileSync(req.file.path, 'utf-8').replace(/^\uFEFF/, '');
+    const data = JSON.parse(raw);
+
+    const filtered = data.filter(r => r.charity_contact_email || r.charity_contact_phone);
+
+    // Drop and recreate
+    db.exec(`DROP TABLE IF EXISTS charities_fts`);
+    db.exec(`DROP TABLE IF EXISTS charities`);
+    db.exec(`
+      CREATE TABLE charities (
+        id INTEGER PRIMARY KEY,
+        charity_name TEXT NOT NULL,
+        charity_number INTEGER,
+        registration_status TEXT,
+        email TEXT,
+        phone TEXT,
+        website TEXT,
+        address TEXT,
+        postcode TEXT,
+        income REAL,
+        expenditure REAL,
+        activities TEXT,
+        date_registered TEXT,
+        pipeline_stage TEXT DEFAULT 'Lead',
+        rag_status TEXT DEFAULT 'red',
+        last_contacted TEXT,
+        notes TEXT DEFAULT '',
+        assigned_to TEXT DEFAULT '',
+        created_at TEXT DEFAULT (datetime('now')),
+        updated_at TEXT DEFAULT (datetime('now'))
+      );
+      CREATE INDEX idx_charities_email ON charities(email);
+      CREATE INDEX idx_charities_phone ON charities(phone);
+      CREATE INDEX idx_charities_name ON charities(charity_name);
+      CREATE INDEX idx_charities_pipeline ON charities(pipeline_stage);
+      CREATE INDEX idx_charities_rag ON charities(rag_status);
+      CREATE INDEX idx_charities_postcode ON charities(postcode);
+    `);
+
+    const insert = db.prepare(`
+      INSERT INTO charities (id, charity_name, charity_number, registration_status, email, phone, website, address, postcode, income, expenditure, activities, date_registered)
+      VALUES (@id, @name, @charityNumber, @status, @email, @phone, @website, @address, @postcode, @income, @expenditure, @activities, @registered)
+    `);
+
+    const BATCH = 5000;
+    const insertBatch = db.transaction((rows) => {
+      for (const r of rows) insert.run(r);
+    });
+
+    let batch = [];
+    for (const r of filtered) {
+      const addr = [r.charity_contact_address1, r.charity_contact_address2, r.charity_contact_address3, r.charity_contact_address4, r.charity_contact_address5]
+        .filter(Boolean).join(', ');
+
+      batch.push({
+        id: r.organisation_number,
+        name: r.charity_name || '',
+        charityNumber: r.registered_charity_number,
+        status: r.charity_registration_status || '',
+        email: r.charity_contact_email || '',
+        phone: r.charity_contact_phone || '',
+        website: r.charity_contact_web || '',
+        address: addr,
+        postcode: r.charity_contact_postcode || '',
+        income: r.latest_income,
+        expenditure: r.latest_expenditure,
+        activities: r.charity_activities || '',
+        registered: r.date_of_registration ? r.date_of_registration.substring(0, 10) : '',
+      });
+
+      if (batch.length >= BATCH) {
+        insertBatch(batch);
+        batch = [];
+      }
+    }
+    if (batch.length > 0) insertBatch(batch);
+
+    // Build FTS
+    db.exec(`
+      CREATE VIRTUAL TABLE IF NOT EXISTS charities_fts USING fts5(
+        charity_name, email, phone, postcode, address, activities,
+        content='charities', content_rowid='id'
+      );
+      INSERT INTO charities_fts(rowid, charity_name, email, phone, postcode, address, activities)
+        SELECT id, charity_name, email, phone, postcode, address, activities FROM charities;
+
+      CREATE TRIGGER IF NOT EXISTS charities_ai AFTER INSERT ON charities BEGIN
+        INSERT INTO charities_fts(rowid, charity_name, email, phone, postcode, address, activities)
+        VALUES (new.id, new.charity_name, new.email, new.phone, new.postcode, new.address, new.activities);
+      END;
+      CREATE TRIGGER IF NOT EXISTS charities_ad AFTER DELETE ON charities BEGIN
+        INSERT INTO charities_fts(charities_fts, rowid, charity_name, email, phone, postcode, address, activities)
+        VALUES ('delete', old.id, old.charity_name, old.email, old.phone, old.postcode, old.address, old.activities);
+      END;
+      CREATE TRIGGER IF NOT EXISTS charities_au AFTER UPDATE ON charities BEGIN
+        INSERT INTO charities_fts(charities_fts, rowid, charity_name, email, phone, postcode, address, activities)
+        VALUES ('delete', old.id, old.charity_name, old.email, old.phone, old.postcode, old.address, old.activities);
+        INSERT INTO charities_fts(rowid, charity_name, email, phone, postcode, address, activities)
+        VALUES (new.id, new.charity_name, new.email, new.phone, new.postcode, new.address, new.activities);
+      END;
+    `);
+
+    // Cleanup uploaded file
+    fs.unlinkSync(req.file.path);
+
+    res.json({ success: true, total: data.length, imported: filtered.length });
+  } catch (err) {
+    console.error('Import error:', err);
+    res.status(500).json({ error: err.message });
+  } finally {
+    importInProgress = false;
+  }
+});
+
+// GET /api/import/status - Check if data has been imported
+app.get('/api/import/status', (req, res) => {
+  try {
+    const count = db.prepare('SELECT COUNT(*) as count FROM charities').get().count;
+    res.json({ hasData: count > 0, count, importInProgress });
+  } catch {
+    res.json({ hasData: false, count: 0, importInProgress });
   }
 });
 

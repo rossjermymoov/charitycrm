@@ -589,6 +589,33 @@
 
   <div class="pagination" id="pagination"></div>
 
+  <!-- Upload/Import Overlay -->
+  <div class="modal-overlay" id="uploadOverlay">
+    <div class="modal" style="max-width:500px;text-align:center">
+      <h2 style="justify-content:center">Import Charity Data</h2>
+      <p style="color:var(--text-dim);margin-bottom:20px;font-size:14px">
+        Upload your <strong>publicextract.charity.json</strong> file from the Charity Commission to get started.
+        Only charities with email or phone details will be imported.
+      </p>
+      <div id="uploadArea" style="border:2px dashed var(--border);border-radius:12px;padding:40px 20px;margin-bottom:16px;cursor:pointer;transition:border-color 0.15s"
+           onclick="document.getElementById('fileInput').click()"
+           ondragover="event.preventDefault();this.style.borderColor='var(--accent)'"
+           ondragleave="this.style.borderColor='var(--border)'"
+           ondrop="handleDrop(event)">
+        <div style="font-size:36px;margin-bottom:10px">📁</div>
+        <div style="font-size:14px;color:var(--text)">Click to select or drag & drop your JSON file</div>
+        <div style="font-size:12px;color:var(--text-dim);margin-top:6px">Max ~400MB</div>
+        <input type="file" id="fileInput" accept=".json" style="display:none" onchange="handleFileSelect(this.files[0])" />
+      </div>
+      <div id="uploadProgress" style="display:none">
+        <div style="background:var(--surface2);border-radius:8px;height:8px;overflow:hidden;margin-bottom:10px">
+          <div id="uploadBar" style="background:var(--accent);height:100%;width:0%;transition:width 0.3s"></div>
+        </div>
+        <div id="uploadStatus" style="font-size:13px;color:var(--text-dim)">Uploading...</div>
+      </div>
+    </div>
+  </div>
+
   <!-- Detail/Edit Modal -->
   <div class="modal-overlay" id="editModal">
     <div class="modal">
@@ -1028,8 +1055,66 @@ function exportCSV() {
   window.location.href = '/api/export/csv';
 }
 
-// Initial load
-loadData();
+// File upload handling
+function handleDrop(e) {
+  e.preventDefault();
+  e.target.closest('#uploadArea').style.borderColor = 'var(--border)';
+  const file = e.dataTransfer.files[0];
+  if (file) handleFileSelect(file);
+}
+
+async function handleFileSelect(file) {
+  if (!file || !file.name.endsWith('.json')) {
+    alert('Please select a .json file');
+    return;
+  }
+
+  document.getElementById('uploadProgress').style.display = 'block';
+  document.getElementById('uploadArea').style.display = 'none';
+  document.getElementById('uploadStatus').textContent = `Uploading ${file.name} (${(file.size / 1024 / 1024).toFixed(0)}MB)...`;
+  document.getElementById('uploadBar').style.width = '30%';
+
+  const formData = new FormData();
+  formData.append('file', file);
+
+  try {
+    document.getElementById('uploadStatus').textContent = 'Importing and indexing data... this may take a minute';
+    document.getElementById('uploadBar').style.width = '60%';
+
+    const res = await fetch('/api/import', { method: 'POST', body: formData });
+    const result = await res.json();
+
+    if (result.error) throw new Error(result.error);
+
+    document.getElementById('uploadBar').style.width = '100%';
+    document.getElementById('uploadStatus').textContent = `Done! Imported ${result.imported.toLocaleString()} charities from ${result.total.toLocaleString()} records.`;
+
+    setTimeout(() => {
+      document.getElementById('uploadOverlay').classList.remove('active');
+      loadData();
+    }, 1500);
+  } catch (err) {
+    document.getElementById('uploadStatus').textContent = 'Error: ' + err.message;
+    document.getElementById('uploadBar').style.width = '0%';
+    document.getElementById('uploadArea').style.display = 'block';
+  }
+}
+
+// Initial load — check if data exists first
+async function init() {
+  try {
+    const status = await api('/api/import/status');
+    if (!status.hasData) {
+      document.getElementById('uploadOverlay').classList.add('active');
+    } else {
+      loadData();
+    }
+  } catch {
+    loadData();
+  }
+}
+
+init();
 </script>
 </body>
 </html>
